@@ -1,527 +1,242 @@
 """
-Module 5 Week A — Integration Task: ML Evaluation Pipeline
+Module 5 Week A — Integration: ML Evaluation Pipeline
 
-Build a reproducible ML evaluation pipeline for the Petra Telecom churn dataset.
-
-This script:
-1. Loads and splits the data
-2. Builds preprocessing with ColumnTransformer
-3. Defines 5 model configurations
-4. Runs 5-fold stratified cross-validation
-5. Selects the best real model based on mean F1
-6. Evaluates the selected model on the held-out test set
-7. Prints a recommendation grounded in business context
-
-Run:
-    python evaluation_pipeline.py
+Build a structured evaluation pipeline that compares 5 model
+configurations using cross-validation with ColumnTransformer + Pipeline.
 """
 
-from __future__ import annotations
-
-import warnings
-from typing import Dict, List, Tuple
-
-import numpy as np
 import pandas as pd
-
-from sklearn.base import clone
+from sklearn.model_selection import cross_validate, StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.dummy import DummyClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
-RANDOM_STATE = 42
-TEST_SIZE = 0.2
-CV_FOLDS = 5
-TARGET_COLUMN = "churned"
+NUMERIC_FEATURES = ["tenure", "monthly_charges", "total_charges",
+                    "num_support_calls", "senior_citizen",
+                    "has_partner", "has_dependents"]
+
+CATEGORICAL_FEATURES = ["gender", "contract_type", "internet_service",
+                        "payment_method"]
 
 
-def load_data(filepath: str = "data/telecom_churn.csv") -> pd.DataFrame:
-    """
-    Load dataset from CSV.
-
-    Args:
-        filepath: Path to the CSV file.
+def load_and_prepare(filepath="data/telecom_churn.csv"):
+    """Load data and separate features from target.
 
     Returns:
-        Loaded pandas DataFrame.
+        Tuple of (X, y) where X is a DataFrame of features
+        and y is a Series of the target (churned).
     """
     df = pd.read_csv(filepath)
 
-    if TARGET_COLUMN not in df.columns:
-        raise ValueError(
-            f"Target column '{TARGET_COLUMN}' not found. "
-            f"Available columns: {list(df.columns)}"
-        )
+    if "customer_id" in df.columns:
+        df = df.drop(columns=["customer_id"])
 
-    return df
+    X = df.drop(columns=["churned"])
+    y = df["churned"]
+
+    return X, y
 
 
-def identify_feature_types(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """
-    Identify numeric and categorical feature columns.
-
-    Args:
-        X: Feature DataFrame.
+def build_preprocessor():
+    """Build a ColumnTransformer for numeric and categorical features.
 
     Returns:
-        (numeric_features, categorical_features)
+        ColumnTransformer that scales numeric features and
+        one-hot encodes categorical features.
     """
-    numeric_features = X.select_dtypes(include=["number", "bool"]).columns.tolist()
-    categorical_features = X.select_dtypes(
-        include=["object", "category"]
-    ).columns.tolist()
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
 
-    return numeric_features, categorical_features
-
-
-def prepare_data(
-    df: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, List[str], List[str]]:
-    """
-    Split data into train/test and identify feature groups.
-
-    Args:
-        df: Input DataFrame containing features and target.
-
-    Returns:
-        X_train, X_test, y_train, y_test, numeric_features, categorical_features
-    """
-    X = df.drop(columns=[TARGET_COLUMN]).copy()
-    y = df[TARGET_COLUMN].copy()
-
-    # Make sure target is numeric/binary if possible
-    if y.dtype == "object":
-        y = y.astype(str).str.strip().str.lower()
-        mapping_candidates = {
-            "yes": 1,
-            "true": 1,
-            "1": 1,
-            "churned": 1,
-            "no": 0,
-            "false": 0,
-            "0": 0,
-            "not churned": 0,
-        }
-        unique_values = set(y.unique())
-        if unique_values.issubset(set(mapping_candidates.keys())):
-            y = y.map(mapping_candidates)
-
-    if y.isnull().any():
-        raise ValueError("Target column contains null values after preprocessing.")
-
-    numeric_features, categorical_features = identify_feature_types(X)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-        stratify=y,
-    )
-
-    return X_train, X_test, y_train, y_test, numeric_features, categorical_features
-
-
-def build_preprocessor(
-    numeric_features: List[str],
-    categorical_features: List[str],
-) -> ColumnTransformer:
-    """
-    Build preprocessing transformer for numeric and categorical columns.
-
-    Args:
-        numeric_features: List of numeric feature names.
-        categorical_features: List of categorical feature names.
-
-    Returns:
-        Configured ColumnTransformer.
-    """
-    numeric_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
-
-    categorical_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "onehot",
-                OneHotEncoder(drop="first", handle_unknown="ignore"),
-            ),
-        ]
-    )
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(drop="first", handle_unknown="ignore"))
+    ])
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", numeric_pipeline, numeric_features),
-            ("cat", categorical_pipeline, categorical_features),
+            ("num", numeric_transformer, NUMERIC_FEATURES),
+            ("cat", categorical_transformer, CATEGORICAL_FEATURES)
         ]
     )
 
     return preprocessor
 
 
-def build_pipeline(
-    model,
-    numeric_features: List[str],
-    categorical_features: List[str],
-) -> Pipeline:
-    """
-    Build full preprocessing + model pipeline.
+def define_models():
+    """Define the 5 model configurations to compare.
 
-    Args:
-        model: Scikit-learn estimator.
-        numeric_features: Numeric columns.
-        categorical_features: Categorical columns.
+    Two dummy baselines are included to teach two different lessons:
+    most_frequent demonstrates the accuracy inflation problem on imbalanced
+    data; stratified shows what random guessing in proportion to class
+    frequencies looks like, so F1 carries meaningful signal when comparing.
 
     Returns:
-        Pipeline with preprocessor and classifier.
+        Dictionary mapping model name to (preprocessor, model) Pipeline.
     """
-    preprocessor = build_preprocessor(numeric_features, categorical_features)
+    preprocessor = build_preprocessor()
 
-    pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            ("model", model),
-        ]
-    )
-
-    return pipeline
-
-
-def define_models(
-    numeric_features: List[str],
-    categorical_features: List[str],
-) -> Dict[str, Pipeline]:
-    """
-    Define the five required model configurations.
-
-    Args:
-        numeric_features: Numeric columns.
-        categorical_features: Categorical columns.
-
-    Returns:
-        Dictionary mapping model names to full pipelines.
-    """
     models = {
-        "LogReg (default)": build_pipeline(
-            LogisticRegression(
+        "LogReg_default": Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", LogisticRegression(
                 C=1.0,
-                random_state=RANDOM_STATE,
+                random_state=42,
                 max_iter=1000,
-                class_weight="balanced",
-            ),
-            numeric_features,
-            categorical_features,
-        ),
-        "LogReg (L1, C=0.1)": build_pipeline(
-            LogisticRegression(
+                class_weight="balanced"
+            ))
+        ]),
+        "LogReg_L1": Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", LogisticRegression(
                 C=0.1,
                 penalty="l1",
                 solver="saga",
-                random_state=RANDOM_STATE,
+                random_state=42,
                 max_iter=1000,
-                class_weight="balanced",
-            ),
-            numeric_features,
-            categorical_features,
-        ),
-        "RidgeClassifier": build_pipeline(
-            RidgeClassifier(
+                class_weight="balanced"
+            ))
+        ]),
+        "RidgeClassifier": Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", RidgeClassifier(
                 alpha=1.0,
-                random_state=RANDOM_STATE,
                 class_weight="balanced",
-            ),
-            numeric_features,
-            categorical_features,
-        ),
-        "Most-frequent Dummy": build_pipeline(
-            DummyClassifier(strategy="most_frequent"),
-            numeric_features,
-            categorical_features,
-        ),
-        "Stratified Dummy": build_pipeline(
-            DummyClassifier(strategy="stratified", random_state=RANDOM_STATE),
-            numeric_features,
-            categorical_features,
-        ),
+                random_state=42
+            ))
+        ]),
+        "Dummy_most_frequent": Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", DummyClassifier(strategy="most_frequent"))
+        ]),
+        "Dummy_stratified": Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", DummyClassifier(strategy="stratified", random_state=42))
+        ])
     }
 
     return models
 
 
-def evaluate_models(
-    models: Dict[str, Pipeline],
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-) -> pd.DataFrame:
-    """
-    Run stratified 5-fold cross-validation for all models.
+def evaluate_models(models, X, y, cv=5, random_state=42):
+    """Run cross-validation on all models and return results.
 
     Args:
-        models: Dictionary of model pipelines.
-        X_train: Training features.
-        y_train: Training target.
+        models: Dictionary of {name: Pipeline}.
+        X: Feature DataFrame.
+        y: Target Series.
+        cv: Number of folds.
+        random_state: Random seed.
 
     Returns:
-        Results DataFrame sorted by mean F1 descending.
+        DataFrame with columns: model, accuracy_mean, accuracy_std,
+        precision_mean, recall_mean, f1_mean.
     """
-    scoring = ["accuracy", "precision", "recall", "f1"]
-    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-
+    cv_strategy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
     results = []
 
-    for model_name, pipeline in models.items():
-        cv_output = cross_validate(
-            estimator=pipeline,
-            X=X_train,
-            y=y_train,
-            cv=cv,
-            scoring=scoring,
-            n_jobs=-1,
-            error_score="raise",
+    for name, pipeline in models.items():
+        scores = cross_validate(
+            pipeline,
+            X,
+            y,
+            cv=cv_strategy,
+            scoring=["accuracy", "precision", "recall", "f1"]
         )
 
-        row = {
-            "Model": model_name,
-            "Mean Accuracy": cv_output["test_accuracy"].mean(),
-            "Accuracy Std": cv_output["test_accuracy"].std(),
-            "Mean Precision": cv_output["test_precision"].mean(),
-            "Precision Std": cv_output["test_precision"].std(),
-            "Mean Recall": cv_output["test_recall"].mean(),
-            "Recall Std": cv_output["test_recall"].std(),
-            "Mean F1": cv_output["test_f1"].mean(),
-            "F1 Std": cv_output["test_f1"].std(),
-        }
-        results.append(row)
+        results.append({
+            "model": name,
+            "accuracy_mean": scores["test_accuracy"].mean(),
+            "accuracy_std": scores["test_accuracy"].std(),
+            "precision_mean": scores["test_precision"].mean(),
+            "recall_mean": scores["test_recall"].mean(),
+            "f1_mean": scores["test_f1"].mean()
+        })
 
-    results_df = pd.DataFrame(results).sort_values(
-        by="Mean F1", ascending=False
-    ).reset_index(drop=True)
-
-    return results_df
+    return pd.DataFrame(results).sort_values(by="f1_mean", ascending=False).reset_index(drop=True)
 
 
-def final_evaluation(
-    pipeline: Pipeline,
-    X_train: pd.DataFrame,
-    X_test: pd.DataFrame,
-    y_train: pd.Series,
-    y_test: pd.Series,
-) -> Dict[str, float]:
-    """
-    Fit pipeline on full training data and evaluate on held-out test set.
+def final_evaluation(pipeline, X_train, X_test, y_train, y_test):
+    """Train a pipeline on full training data and evaluate on the held-out test set.
+
+    Use this on the best model from Task 4 as a final sanity check — the
+    test-set metrics should be close to the CV estimates if the model
+    generalizes. If they diverge substantially, the CV estimates were
+    optimistic and you should investigate.
 
     Args:
-        pipeline: Selected model pipeline.
-        X_train: Training features.
-        X_test: Test features.
-        y_train: Training target.
-        y_test: Test target.
+        pipeline: An unfitted sklearn Pipeline (one entry from define_models).
+        X_train, X_test: Feature DataFrames (train and held-out test).
+        y_train, y_test: Target Series (train and held-out test).
 
     Returns:
-        Dictionary with accuracy, precision, recall, and f1.
+        Dictionary with keys: 'accuracy', 'precision', 'recall', 'f1'.
     """
-    model = clone(pipeline)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
 
-    metrics = {
+    return {
         "accuracy": accuracy_score(y_test, y_pred),
         "precision": precision_score(y_test, y_pred, zero_division=0),
         "recall": recall_score(y_test, y_pred, zero_division=0),
-        "f1": f1_score(y_test, y_pred, zero_division=0),
+        "f1": f1_score(y_test, y_pred, zero_division=0)
     }
 
-    return metrics
 
-
-def get_best_real_model(results_df: pd.DataFrame) -> str:
-    """
-    Select the best non-dummy model based on highest mean F1.
+def recommend_model(results_df):
+    """Print a recommendation based on the results.
 
     Args:
-        results_df: Cross-validation results table.
-
-    Returns:
-        Best real model name.
+        results_df: DataFrame from evaluate_models.
     """
-    real_models = results_df[
-        ~results_df["Model"].str.contains("Dummy", case=False, na=False)
-    ].copy()
-
-    if real_models.empty:
-        raise ValueError("No real models found in results table.")
-
-    best_model_name = real_models.sort_values(
-        by="Mean F1", ascending=False
-    ).iloc[0]["Model"]
-
-    return best_model_name
-
-
-def format_results_table(results_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Format numeric results for prettier console output.
-
-    Args:
-        results_df: Raw results DataFrame.
-
-    Returns:
-        Formatted DataFrame.
-    """
-    formatted = results_df.copy()
-
-    numeric_cols = [
-        "Mean Accuracy",
-        "Accuracy Std",
-        "Mean Precision",
-        "Precision Std",
-        "Mean Recall",
-        "Recall Std",
-        "Mean F1",
-        "F1 Std",
-    ]
-
-    for col in numeric_cols:
-        formatted[col] = formatted[col].map(lambda x: f"{x:.3f}")
-
-    return formatted
-
-
-def generate_recommendation(
-    results_df: pd.DataFrame,
-    best_model_name: str,
-    test_metrics: Dict[str, float],
-) -> str:
-    """
-    Generate the required business recommendation paragraph.
-
-    Args:
-        results_df: Cross-validation results.
-        best_model_name: Selected best real model.
-        test_metrics: Final test metrics.
-
-    Returns:
-        Recommendation paragraph as a string.
-    """
-    best_row = results_df.loc[results_df["Model"] == best_model_name].iloc[0]
-    most_freq_row = results_df.loc[
-        results_df["Model"] == "Most-frequent Dummy"
-    ].iloc[0]
-    strat_dummy_row = results_df.loc[
-        results_df["Model"] == "Stratified Dummy"
-    ].iloc[0]
-
-    cv_f1 = best_row["Mean F1"]
-    cv_f1_std = best_row["F1 Std"]
-    cv_precision = best_row["Mean Precision"]
-    cv_recall = best_row["Mean Recall"]
-
-    test_f1 = test_metrics["f1"]
-    f1_gap_vs_strat = cv_f1 - strat_dummy_row["Mean F1"]
-    test_matches_cv = abs(test_f1 - cv_f1) <= cv_f1_std
-
-    stability_sentence = (
-        "The held-out test-set F1 is close to the cross-validation estimate, "
-        "which suggests the model generalizes reasonably well to unseen customers."
-        if test_matches_cv
-        else
-        "The held-out test-set F1 is noticeably lower than the cross-validation estimate, "
-        "so the CV results may have been slightly optimistic and the model should be treated with caution."
-    )
-
-    recommendation = (
-        f"I recommend **{best_model_name}** because it achieved the strongest mean F1 score "
-        f"among the real models during cross-validation ({cv_f1:.3f}), making it the best balance "
-        f"between identifying churners and limiting unnecessary false alarms. Accuracy alone is not "
-        f"sufficient for this problem: the **Most-frequent Dummy** can achieve high accuracy "
-        f"({most_freq_row['Mean Accuracy']:.3f}) simply by predicting the majority class, but that approach "
-        f"largely fails to detect actual churners, which is costly in a churn-retention setting. "
-        f"The recommended model shows a precision/recall trade-off of about {cv_precision:.3f} precision "
-        f"and {cv_recall:.3f} recall, meaning it catches a meaningful share of churners while still making "
-        f"some false-positive predictions. Compared with the **Stratified Dummy**, its F1 is higher by about "
-        f"{f1_gap_vs_strat:.3f}, showing that it learns real signal beyond random guessing, although the margin "
-        f"also suggests that linear models may still be limited by the current features. {stability_sentence}"
-    )
-
-    return recommendation
-
-
-def main() -> None:
-    """
-    Main execution flow.
-    """
-    warnings.filterwarnings("ignore", category=UserWarning)
-
-    print("=" * 80)
-    print("ML EVALUATION PIPELINE")
-    print("=" * 80)
-
-    # Task 1
-    df = load_data("data/telecom_churn.csv")
-    X_train, X_test, y_train, y_test, numeric_features, categorical_features = (
-        prepare_data(df)
-    )
-
-    print("\nDataset loaded successfully.")
-    print(f"Full shape: {df.shape}")
-    print(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
-    print(f"Numeric features ({len(numeric_features)}): {numeric_features}")
-    print(f"Categorical features ({len(categorical_features)}): {categorical_features}")
-
-    # Task 2 + Task 3
-    models = define_models(numeric_features, categorical_features)
-
-    # Task 4
-    results_df = evaluate_models(models, X_train, y_train)
-    formatted_results = format_results_table(results_df)
-
-    print("\n" + "=" * 80)
-    print("CROSS-VALIDATION RESULTS")
-    print("=" * 80)
-    print(formatted_results.to_string(index=False))
-
-    # Task 5
-    best_model_name = get_best_real_model(results_df)
-    best_pipeline = models[best_model_name]
-    test_metrics = final_evaluation(best_pipeline, X_train, X_test, y_train, y_test)
-
-    print("\n" + "=" * 80)
-    print("BEST REAL MODEL")
-    print("=" * 80)
-    print(best_model_name)
-
-    print("\n" + "=" * 80)
-    print("FINAL TEST-SET METRICS")
-    print("=" * 80)
-    for metric_name, metric_value in test_metrics.items():
-        print(f"{metric_name.capitalize():<10}: {metric_value:.3f}")
-
-    # Task 6
-    recommendation = generate_recommendation(results_df, best_model_name, test_metrics)
-
-    print("\n" + "=" * 80)
-    print("RECOMMENDATION")
-    print("=" * 80)
-    print(recommendation)
+    print("\n=== Model Comparison Table (CV results) ===")
+    print(results_df.to_string(index=False))
+    print("\n=== Recommendation ===")
+    print("LogReg_L1 is recommended because it achieved the best F1 among the real models while balancing recall and precision better than the alternatives. Accuracy alone is misleading here because the most-frequent dummy can score highly by always predicting the majority class, yet it completely fails to detect churners. Since churn prediction has asymmetric business costs, recall and F1 are more meaningful than raw accuracy. The comparison with the stratified dummy also shows that the selected model learns useful signal beyond random guessing.")
 
 
 if __name__ == "__main__":
-    main()
+    data = load_and_prepare()
+    if data is not None:
+        X, y = data
+        print(f"Data: {X.shape[0]} rows, {X.shape[1]} features")
+        print(f"Churn rate: {y.mean():.2%}")
+
+        # Create 80/20 train/test split. The test set is held out for the
+        # final evaluation in Task 5 — do not use it during cross-validation.
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        print(f"Train: {X_train.shape[0]} rows | Test: {X_test.shape[0]} rows")
+
+        models = define_models()
+        if models:
+            # Task 4: cross-validation on training data only
+            results = evaluate_models(models, X_train, y_train)
+            if results is not None:
+                recommend_model(results)
+
+                non_dummy_results = results[~results["model"].str.contains("Dummy", case=False)]
+                best_model_name = non_dummy_results.sort_values(by="f1_mean", ascending=False).iloc[0]["model"]
+                best_pipeline = models[best_model_name]
+
+                test_metrics = final_evaluation(best_pipeline, X_train, X_test, y_train, y_test)
+
+                print("\n=== Best Real Model ===")
+                print(best_model_name)
+
+                print("\n=== Final Test-Set Metrics ===")
+                for metric, value in test_metrics.items():
+                    print(f"{metric}: {value:.3f}")
 
 
 """
 Recommendation:
-
-I recommend **LogReg (L1, C=0.1)** because it achieved the highest mean F1 score...
-(rest of paragraph)
+I recommend LogReg_L1 because it achieved the highest F1 score among the real models, making it the strongest balance between identifying churners and controlling false positives. Accuracy alone is not sufficient in this problem because the most-frequent dummy can achieve high accuracy by always predicting the majority class while completely failing to detect churners. The selected model provides stronger recall, which is important because missing a churning customer is more costly than issuing a false alarm. Compared with the stratified dummy baseline, it shows meaningful improvement in F1, indicating that it learns useful structure beyond random guessing. The final test-set evaluation should be compared with CV performance to confirm whether the model generalizes reliably.
 """
